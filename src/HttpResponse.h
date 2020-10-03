@@ -37,7 +37,7 @@
 namespace uWS {
 
 /* Some pre-defined status constants to use with writeStatus */
-static const char *HTTP_200_OK = "200 OK";
+static const char *HTTP_200 = "200";
 
 /* The general timeout for HTTP sockets */
 static const int HTTP_TIMEOUT_S = 10;
@@ -95,7 +95,7 @@ private:
      * Will start timeout if stream reaches totalSize or write failure. */
     bool internalEnd(std::string_view data, size_t totalSize, bool optional, bool allowContentLength = true) {
         /* Write status if not already done */
-        writeStatus(HTTP_200_OK);
+        writeStatus(HTTP_200);
 
         /* If no total size given then assume this chunk is everything */
         if (!totalSize) {
@@ -204,7 +204,7 @@ public:
         char secWebSocketAccept[29] = {};
         WebSocketHandshake::generate(secWebSocketKey.data(), secWebSocketAccept);
 
-        writeStatus("101 Switching Protocols")
+        writeStatus("101")
             ->writeHeader("Upgrade", "websocket")
             ->writeHeader("Connection", "Upgrade")
             ->writeHeader("Sec-WebSocket-Accept", secWebSocketAccept);
@@ -336,7 +336,7 @@ public:
 
     /* Write 100 Continue, can be done any amount of times */
     HttpResponse *writeContinue() {
-        Super::write("HTTP/1.1 100 Continue\r\n\r\n", 25);
+        Super::write("HTTP/1.1 100\r\n\r\n", 25);
         return this;
     }
 
@@ -360,7 +360,7 @@ public:
 
     /* Write an HTTP header with string value */
     HttpResponse *writeHeader(std::string_view key, std::string_view value) {
-        writeStatus(HTTP_200_OK);
+        writeStatus(HTTP_200);
 
         Super::write(key.data(), (int) key.length());
         Super::write(": ", 2);
@@ -391,7 +391,7 @@ public:
 
     /* Write parts of the response in chunking fashion. Starts timeout if failed. */
     bool write(std::string_view data) {
-        writeStatus(HTTP_200_OK);
+        writeStatus(HTTP_200);
 
         /* Do not allow sending 0 chunks, they mark end of response */
         if (!data.length()) {
