@@ -34,7 +34,7 @@ struct WebSocket : AsyncSocket<SSL> {
 private:
     typedef AsyncSocket<SSL> Super;
 
-    void *init(bool perMessageDeflate, int compressOptions, std::string &&backpressure) {
+    void *init(bool perMessageDeflate, CompressOptions compressOptions, std::string &&backpressure) {
         new (us_socket_ext(SSL, (us_socket_t *) this)) WebSocketData(perMessageDeflate, compressOptions, std::move(backpressure));
         return this;
     }
@@ -64,6 +64,10 @@ public:
 
         /* Skip sending and report success if we are over the limit of maxBackpressure */
         if (webSocketContextData->maxBackpressure && webSocketContextData->maxBackpressure < getBufferedAmount()) {
+            /* Also defer a close if we should */
+            if (webSocketContextData->closeOnBackpressureLimit) {
+                us_socket_shutdown_read(SSL, (us_socket_t *) this);
+            }
             return true;
         }
 
@@ -118,7 +122,11 @@ public:
         }
 
         /* Every successful send resets the timeout */
-        Super::timeout(webSocketContextData->idleTimeout);
+        if (webSocketContextData->resetIdleTimeoutOnSend) {
+            Super::timeout(webSocketContextData->idleTimeoutComponents.first);
+            WebSocketData *webSocketData = (WebSocketData *) Super::getAsyncSocketData();
+            webSocketData->hasTimedOut = false;
+        }
 
         /* Return success */
         return true;
@@ -138,9 +146,9 @@ public:
 
         /* Format and send the close frame */
         static const int MAX_CLOSE_PAYLOAD = 123;
-        int length = (int) std::min<size_t>(MAX_CLOSE_PAYLOAD, message.length());
+        size_t length = std::min<size_t>(MAX_CLOSE_PAYLOAD, message.length());
         char closePayload[MAX_CLOSE_PAYLOAD + 2];
-        int closePayloadLength = (int) protocol::formatClosePayload(closePayload, (uint16_t) code, message.data(), length);
+        size_t closePayloadLength = protocol::formatClosePayload(closePayload, (uint16_t) code, message.data(), length);
         bool ok = send(std::string_view(closePayload, closePayloadLength), OpCode::CLOSE);
 
         /* FIN if we are ok and not corked */
@@ -183,7 +191,7 @@ public:
     }
 
     /* Subscribe to a topic according to MQTT rules and syntax */
-    void subscribe(std::string_view topic) {
+    void subscribe(std::string_view topic, bool nonStrict = false) {
         WebSocketContextData<SSL> *webSocketContextData = (WebSocketContextData<SSL> *) us_socket_context_ext(SSL,
             (us_socket_context_t *) us_socket_context(SSL, (us_socket_t *) this)
         );
@@ -194,18 +202,18 @@ public:
             webSocketData->subscriber = new Subscriber(this);
         }
 
-        webSocketContextData->topicTree.subscribe(topic, webSocketData->subscriber);
+        webSocketContextData->topicTree.subscribe(topic, webSocketData->subscriber, nonStrict);
     }
 
     /* Unsubscribe from a topic, returns true if we were subscribed */
-    bool unsubscribe(std::string_view topic) {
+    bool unsubscribe(std::string_view topic, bool nonStrict = false) {
         WebSocketContextData<SSL> *webSocketContextData = (WebSocketContextData<SSL> *) us_socket_context_ext(SSL,
             (us_socket_context_t *) us_socket_context(SSL, (us_socket_t *) this)
         );
 
         WebSocketData *webSocketData = (WebSocketData *) us_socket_ext(SSL, (us_socket_t *) this);
 
-        return webSocketContextData->topicTree.unsubscribe(topic, webSocketData->subscriber);
+        return webSocketContextData->topicTree.unsubscribe(topic, webSocketData->subscriber, nonStrict);
     }
 
     /* Unsubscribe from all topics you might be subscribed to */
@@ -224,8 +232,15 @@ public:
         WebSocketContextData<SSL> *webSocketContextData = (WebSocketContextData<SSL> *) us_socket_context_ext(SSL,
             (us_socket_context_t *) us_socket_context(SSL, (us_socket_t *) this)
         );
-        /* Is the same as publishing per websocket context */
-        webSocketContextData->publish(topic, message, opCode, compress);
+
+        /* Make us a subscriber if we aren't yet (important for allocating a sender address) */
+        WebSocketData *webSocketData = (WebSocketData *) us_socket_ext(SSL, (us_socket_t *) this);
+        if (!webSocketData->subscriber) {
+            webSocketData->subscriber = new Subscriber(this);
+        }
+
+        /* Publish as sender, does not receive its own messages even if subscribed to relevant topics */
+        webSocketContextData->publish(topic, message, opCode, compress, webSocketData->subscriber);
     }
 };
 
