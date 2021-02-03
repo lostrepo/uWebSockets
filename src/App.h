@@ -153,10 +153,9 @@ public:
                 char secWebSocketAccept[29] = {};
                 WebSocketHandshake::generate(secWebSocketKey.data(), secWebSocketAccept);
 
-                res->writeStatus("101 Switching Protocols")
-                    ->writeHeader("Upgrade", "websocket")
-                    ->writeHeader("Connection", "Upgrade")
-                    ->writeHeader("Sec-WebSocket-Accept", secWebSocketAccept);
+				// use less calls
+                res->writeStatus("101")
+                    ->writeHeader("Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept", secWebSocketAccept);
 
                 /* Select first subprotocol if present */
                 std::string_view secWebSocketProtocol = req->getHeader("sec-websocket-protocol");
