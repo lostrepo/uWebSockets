@@ -1,3 +1,6 @@
 [submodule "uSockets"]
 	path = uSockets
-	url = https://github.com/lostero/uSockets
+	url = https://github.com/lostrepo/uSockets
+[submodule "fuzzing/libEpollFuzzer"]
+	path = fuzzing/libEpollFuzzer
+	url = https://github.com/lostrepo/libEpollFuzzer

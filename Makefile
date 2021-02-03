@@ -1,7 +1,15 @@
-EXAMPLE_FILES := HelloWorld EchoServer BroadcastingEchoServer
+EXAMPLE_FILES := HelloWorld ServerName EchoServer BroadcastingEchoServer UpgradeSync UpgradeAsync
 THREADED_EXAMPLE_FILES := HelloWorldThreaded EchoServerThreaded
-override CXXFLAGS += -lpthread -std=c++17 -Isrc -IuSockets/src
+override CXXFLAGS += -lpthread -Wpedantic -Wall -Wextra -Wsign-conversion -Wconversion -std=c++2a -Isrc -IuSockets/src
 override LDFLAGS += uSockets/*.o -lz
+
+DESTDIR ?=
+prefix ?= /usr/local
+
+# WITH_PROXY enables PROXY Protocol v2 support
+ifeq ($(WITH_PROXY),1)
+	override CXXFLAGS += -DUWS_WITH_PROXY
+endif
 
 # WITH_OPENSSL=1 enables OpenSSL 1.1+ support
 ifeq ($(WITH_OPENSSL),1)
@@ -21,17 +29,25 @@ endif
 
 # WITH_ASAN builds with sanitizers
 ifeq ($(WITH_ASAN),1)
-	override CXXFLAGS += -fsanitize=address
+	override CXXFLAGS += -fsanitize=address -g
 	override LDFLAGS += -lasan
 endif
 
 .PHONY: examples
 examples:
-	cd uSockets && make
-	$(foreach FILE,$(EXAMPLE_FILES),$(CXX) -flto -O3 $(CXXFLAGS) examples/$(FILE).cpp -o $(FILE) $(LDFLAGS);)
-	$(foreach FILE,$(THREADED_EXAMPLE_FILES),$(CXX) -pthread -flto -O3 $(CXXFLAGS) examples/$(FILE).cpp -o $(FILE) $(LDFLAGS);)
+	$(MAKE) -C uSockets; \
+	for FILE in $(EXAMPLE_FILES); do $(CXX) -flto -O3 $(CXXFLAGS) examples/$$FILE.cpp -o $$FILE $(LDFLAGS) & done; \
+	for FILE in $(THREADED_EXAMPLE_FILES); do $(CXX) -pthread -flto -O3 $(CXXFLAGS) examples/$$FILE.cpp -o $$FILE $(LDFLAGS) & done; \
+	wait
+
+install:
+	mkdir -p "$(DESTDIR)$(prefix)/include/uWebSockets/f2"
+	cp -r src/* "$(DESTDIR)$(prefix)/include/uWebSockets"
 
 all:
-	make examples
-	cd fuzzing && make && rm -f *.o
-	cd benchmarks && make && rm -f *.o
+	$(MAKE) examples
+	$(MAKE) -C fuzzing
+	$(MAKE) -C benchmarks
+clean:
+	rm -rf $(EXAMPLE_FILES) $(THREADED_EXAMPLE_FILES)
+	rm -rf fuzzing/*.o benchmarks/*.o

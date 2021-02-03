@@ -1,5 +1,5 @@
 /*
- * Authored by Alex Hultman, 2018-2019.
+ * Authored by Alex Hultman, 2018-2020.
  * Intellectual property of third-party.
 
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -53,12 +53,15 @@ public:
         delete [] corkBuffer;
     }
 
+    /* Be silent */
+    bool noMark = false;
+
     /* Good 16k for SSL perf. */
-    static const int CORK_BUFFER_SIZE = 16 * 1024;
+    static const unsigned int CORK_BUFFER_SIZE = 16 * 1024;
 
     /* Cork data */
     char *corkBuffer = new char[CORK_BUFFER_SIZE];
-    int corkOffset = 0;
+    unsigned int corkOffset = 0;
     void *corkedSocket = nullptr;
 
     /* Per message deflate data */

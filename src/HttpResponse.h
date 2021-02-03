@@ -1,5 +1,5 @@
 /*
- * Authored by Alex Hultman, 2018-2019.
+ * Authored by Alex Hultman, 2018-2020.
  * Intellectual property of third-party.
 
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,6 +24,11 @@
 #include "HttpResponseData.h"
 #include "HttpContextData.h"
 #include "Utilities.h"
+
+#include "WebSocketExtensions.h"
+#include "WebSocketHandshake.h"
+#include "WebSocket.h"
+#include "WebSocketContextData.h"
 
 #include "f2/function2.hpp"
 
@@ -56,10 +61,10 @@ private:
         Super::write(buf, length);
     }
 
-    /* Write an unsigned 32-bit integer */
-    void writeUnsigned(unsigned int value) {
-        char buf[10];
-        int length = utils::u32toa(value, buf);
+    /* Write an unsigned 64-bit integer */
+    void writeUnsigned64(uint64_t value) {
+        char buf[20];
+        int length = utils::u64toa(value, buf);
 
         /* For now we do this copy */
         Super::write(buf, length);
@@ -77,12 +82,18 @@ private:
 
     /* Called only once per request */
     void writeMark() {
-        writeHeader("uWebSockets", "v0.16");
+        /* You can disable this altogether */
+#ifndef UWS_HTTPRESPONSE_NO_WRITEMARK
+        if (!Super::getLoopData()->noMark) {
+            /* We only expose major version */
+            writeHeader("uWebSockets", "19");
+        }
+#endif
     }
 
     /* Returns true on success, indicating that it might be feasible to write more data.
      * Will start timeout if stream reaches totalSize or write failure. */
-    bool internalEnd(std::string_view data, int totalSize, bool optional, bool allowContentLength = true) {
+    bool internalEnd(std::string_view data, size_t totalSize, bool optional, bool allowContentLength = true, bool closeConnection = false) {
         /* Write status if not already done */
         writeStatus(HTTP_200);
 
@@ -92,6 +103,22 @@ private:
         }
 
         HttpResponseData<SSL> *httpResponseData = getHttpResponseData();
+
+        /* In some cases, such as when refusing huge data we want to close the connection when drained */
+        if (closeConnection) {
+
+            /* HTTP 1.1 must send this back unless the client already sent it to us.
+             * It is a connection close when either of the two parties say so but the
+             * one party must tell the other one so.
+             *
+             * This check also serves to limit writing the header only once. */
+            if ((httpResponseData->state & HttpResponseData<SSL>::HTTP_CONNECTION_CLOSE) == 0) {
+                writeHeader("Connection", "close");
+            }
+
+            httpResponseData->state |= HttpResponseData<SSL>::HTTP_CONNECTION_CLOSE;
+        }
+
         if (httpResponseData->state & HttpResponseData<SSL>::HTTP_WRITE_CALLED) {
 
             /* We do not have tryWrite-like functionalities, so ignore optional in this path */
@@ -99,11 +126,11 @@ private:
             /* Do not allow sending 0 chunk here */
             if (data.length()) {
                 Super::write("\r\n", 2);
-                writeUnsignedHex(data.length());
+                writeUnsignedHex((unsigned int) data.length());
                 Super::write("\r\n", 2);
 
                 /* Ignoring optional for now */
-                Super::write(data.data(), data.length());
+                Super::write(data.data(), (int) data.length());
             }
 
             /* Terminating 0 chunk */
@@ -118,13 +145,13 @@ private:
             /* Write content-length on first call */
             if (!(httpResponseData->state & HttpResponseData<SSL>::HTTP_END_CALLED)) {
                 /* Write mark, this propagates to WebSockets too */
-                // writeMark();
+                /* writeMark(); */
 
                 /* WebSocket upgrades does not allow content-length */
                 if (allowContentLength) {
                     /* Even zero is a valid content-length */
                     Super::write("Content-Length: ", 16);
-                    writeUnsigned(totalSize);
+                    writeUnsigned64(totalSize);
                     Super::write("\r\n\r\n", 4);
                 } else {
                     Super::write("\r\n", 2);
@@ -138,7 +165,16 @@ private:
              * if it failed to drain any prior failed header writes */
 
             /* Write as much as possible without causing backpressure */
-            auto [written, failed] = Super::write(data.data(), data.length(), optional);
+            size_t written = 0;
+            bool failed = false;
+            while (written < data.length() && !failed) {
+                /* uSockets only deals with int sizes, so pass chunks of max signed int size */
+                auto writtenFailed = Super::write(data.data() + written, (int) std::min<size_t>(data.length() - written, INT_MAX), optional);
+
+                written += (size_t) writtenFailed.first;
+                failed = writtenFailed.second;
+            }
+
             httpResponseData->offset += written;
 
             /* Success is when we wrote the entire thing without any failures */
@@ -158,19 +194,139 @@ private:
         }
     }
 
-    /* This call is identical to end, but will never write content-length and is thus suitable for upgrades */
-    void upgrade() {
-        internalEnd({nullptr, 0}, 0, false, false);
+public:
+    /* If we have proxy support; returns the proxed source address as reported by the proxy. */
+#ifdef UWS_WITH_PROXY
+    std::string_view getProxiedRemoteAddress() {
+        return getHttpResponseData()->proxyParser.getSourceAddress();
     }
 
-public:
+    std::string_view getProxiedRemoteAddressAsText() {
+        return Super::addressAsText(getProxiedRemoteAddress());
+    }
+#endif
+
+    /* Manually upgrade to WebSocket. Typically called in upgrade handler. Immediately calls open handler.
+     * NOTE: Will invalidate 'this' as socket might change location in memory. Throw away aftert use. */
+    template <typename UserData>
+    void upgrade(UserData &&userData, std::string_view secWebSocketKey, std::string_view secWebSocketProtocol,
+            std::string_view secWebSocketExtensions,
+            struct us_socket_context_t *webSocketContext) {
+
+        /* Extract needed parameters from WebSocketContextData */
+        WebSocketContextData<SSL> *webSocketContextData = (WebSocketContextData<SSL> *) us_socket_context_ext(SSL, webSocketContext);
+
+        /* Note: OpenSSL can be used here to speed this up somewhat */
+        char secWebSocketAccept[29] = {};
+        WebSocketHandshake::generate(secWebSocketKey.data(), secWebSocketAccept);
+
+        writeStatus("101")
+            ->writeHeader("Upgrade", "websocket")
+            ->writeHeader("Connection", "Upgrade")
+            ->writeHeader("Sec-WebSocket-Accept", secWebSocketAccept);
+
+        /* Select first subprotocol if present */
+        if (secWebSocketProtocol.length()) {
+            writeHeader("Sec-WebSocket-Protocol", secWebSocketProtocol.substr(0, secWebSocketProtocol.find(',')));
+        }
+
+        /* Negotiate compression */
+        bool perMessageDeflate = false;
+        CompressOptions compressOptions = CompressOptions::DISABLED;
+        if (secWebSocketExtensions.length() && webSocketContextData->compression != DISABLED) {
+
+            /* We always want shared inflation */
+            int wantedInflationWindow = 0;
+
+            /* Map from selected compressor */
+            int wantedCompressionWindow = (webSocketContextData->compression & 0xFF00) >> 8;
+
+            auto [negCompression, negCompressionWindow, negInflationWindow, negResponse] =
+            uWS::negotiateCompression(true, wantedCompressionWindow, wantedInflationWindow,
+                                        secWebSocketExtensions);
+
+            if (negCompression) {
+                perMessageDeflate = true;
+
+                /* Map from windowBits to compressor */
+                if (negCompressionWindow == 0) {
+                    compressOptions = CompressOptions::SHARED_COMPRESSOR;
+                } else {
+                    compressOptions = (CompressOptions) ((uint32_t) (negCompressionWindow << 8)
+                                                        | (uint32_t) (negCompressionWindow - 7));
+
+                    /* If we are dedicated and have the 3kb then correct any 4kb to 3kb,
+                     * (they both share the windowBits = 9) */
+                    if (webSocketContextData->compression == DEDICATED_COMPRESSOR_3KB) {
+                        compressOptions = DEDICATED_COMPRESSOR_3KB;
+                    }
+                }
+
+                writeHeader("Sec-WebSocket-Extensions", negResponse);
+            }
+        }
+
+        internalEnd({nullptr, 0}, 0, false, false);
+
+        /* Grab the httpContext from res */
+        HttpContext<SSL> *httpContext = (HttpContext<SSL> *) us_socket_context(SSL, (struct us_socket_t *) this);
+
+        /* Move any backpressure out of HttpResponse */
+        std::string backpressure(std::move(((AsyncSocketData<SSL> *) getHttpResponseData())->buffer));
+
+        /* Destroy HttpResponseData */
+        getHttpResponseData()->~HttpResponseData();
+
+        /* Before we adopt and potentially change socket, check if we are corked */
+        bool wasCorked = Super::isCorked();
+
+        /* Adopting a socket invalidates it, do not rely on it directly to carry any data */
+        WebSocket<SSL, true> *webSocket = (WebSocket<SSL, true> *) us_socket_context_adopt_socket(SSL,
+                    (us_socket_context_t *) webSocketContext, (us_socket_t *) this, sizeof(WebSocketData) + sizeof(UserData));
+
+        /* For whatever reason we were corked, update cork to the new socket */
+        if (wasCorked) {
+            webSocket->AsyncSocket<SSL>::cork();
+        }
+
+        /* Initialize websocket with any moved backpressure intact */
+        webSocket->init(perMessageDeflate, compressOptions, std::move(backpressure));
+
+        /* We should only mark this if inside the parser; if upgrading "async" we cannot set this */
+        HttpContextData<SSL> *httpContextData = httpContext->getSocketContextData();
+        if (httpContextData->isParsingHttp) {
+            /* We need to tell the Http parser that we changed socket */
+            httpContextData->upgradedWebSocket = webSocket;
+        }
+
+        /* Arm idleTimeout */
+        us_socket_timeout(SSL, (us_socket_t *) webSocket, webSocketContextData->idleTimeoutComponents.first);
+
+        /* Move construct the UserData right before calling open handler */
+        new (webSocket->getUserData()) UserData(std::move(userData));
+
+        /* Emit open event and start the timeout */
+        if (webSocketContextData->openHandler) {
+            webSocketContextData->openHandler(webSocket);
+        }
+    }
+
     /* Immediately terminate this Http response */
     using Super::close;
 
+    /* See AsyncSocket */
     using Super::getRemoteAddress;
+    using Super::getRemoteAddressAsText;
+    using Super::getNativeHandle;
 
     /* Note: Headers are not checked in regards to timeout.
      * We only check when you actively push data or end the request */
+
+    /* Write 100 Continue, can be done any amount of times */
+    HttpResponse *writeContinue() {
+        Super::write("HTTP/1.1 100\r\n\r\n", 25);
+        return this;
+    }
 
     /* Write the HTTP status */
     HttpResponse *writeStatus(std::string_view status) {
@@ -185,7 +341,7 @@ public:
         httpResponseData->state |= HttpResponseData<SSL>::HTTP_STATUS_CALLED;
 
         Super::write("HTTP/1.1 ", 9);
-        Super::write(status.data(), status.length());
+        Super::write(status.data(), (int) status.length());
         Super::write("\r\n", 2);
         return this;
     }
@@ -194,30 +350,32 @@ public:
     HttpResponse *writeHeader(std::string_view key, std::string_view value) {
         writeStatus(HTTP_200);
 
-        Super::write(key.data(), key.length());
+        Super::write(key.data(), (int) key.length());
         Super::write(": ", 2);
-        Super::write(value.data(), value.length());
+        Super::write(value.data(), (int) value.length());
         Super::write("\r\n", 2);
         return this;
     }
 
     /* Write an HTTP header with unsigned int value */
-    HttpResponse *writeHeader(std::string_view key, unsigned int value) {
-        Super::write(key.data(), key.length());
+    HttpResponse *writeHeader(std::string_view key, uint64_t value) {
+        writeStatus(HTTP_200_OK);
+
+        Super::write(key.data(), (int) key.length());
         Super::write(": ", 2);
-        writeUnsigned(value);
+        writeUnsigned64(value);
         Super::write("\r\n", 2);
         return this;
     }
 
     /* End the response with an optional data chunk. Always starts a timeout. */
-    void end(std::string_view data = {}) {
-        internalEnd(data, data.length(), false);
+    void end(std::string_view data = {}, bool closeConnection = false) {
+        internalEnd(data, data.length(), false, true, closeConnection);
     }
 
     /* Try and end the response. Returns [true, true] on success.
      * Starts a timeout in some cases. Returns [ok, hasResponded] */
-    std::pair<bool, bool> tryEnd(std::string_view data, int totalSize = 0) {
+    std::pair<bool, bool> tryEnd(std::string_view data, size_t totalSize = 0) {
         return {internalEnd(data, totalSize, true), hasResponded()};
     }
 
@@ -235,17 +393,17 @@ public:
 
         if (!(httpResponseData->state & HttpResponseData<SSL>::HTTP_WRITE_CALLED)) {
             /* Write mark on first call to write */
-            // writeMark();
+            /* writeMark(); */
 
             writeHeader("Transfer-Encoding", "chunked");
             httpResponseData->state |= HttpResponseData<SSL>::HTTP_WRITE_CALLED;
         }
 
         Super::write("\r\n", 2);
-        writeUnsignedHex(data.length());
+        writeUnsignedHex((unsigned int) data.length());
         Super::write("\r\n", 2);
 
-        auto [written, failed] = Super::write(data.data(), data.length());
+        auto [written, failed] = Super::write(data.data(), (int) data.length());
         if (failed) {
             Super::timeout(HTTP_TIMEOUT_S);
         }
@@ -255,7 +413,7 @@ public:
     }
 
     /* Get the current byte write offset for this Http response */
-    int getWriteOffset() {
+    size_t getWriteOffset() {
         HttpResponseData<SSL> *httpResponseData = getHttpResponseData();
 
         return httpResponseData->offset;
@@ -268,30 +426,29 @@ public:
         return !(httpResponseData->state & HttpResponseData<SSL>::HTTP_RESPONSE_PENDING);
     }
 
-    /* EXPERIMENTAL - corks the response if possible */
+    /* Corks the response if possible. Leaves already corked socket be. */
     HttpResponse *cork(fu2::unique_function<void()> &&handler) {
-        bool corked = Super::isCorked();
-        if (!corked && Super::canCork()) {
+        if (!Super::isCorked() && Super::canCork()) {
             Super::cork();
-            corked = true;
-        }
+            handler();
 
-        handler();
-
-        if (corked) {
-            /* Timeout on uncork failure (EXPERIMENTAL) */
+            /* Timeout on uncork failure, since most writes will succeed while corked */
             auto [written, failed] = Super::uncork();
             if (failed) {
-                // do we have the same timeout for websockets?
-                Super::timeout(10); // this is completely wrong!
+                /* For now we only have one single timeout so let's use it */
+                /* This behavior should equal the behavior in HttpContext when uncorking fails */
+                Super::timeout(HTTP_TIMEOUT_S);
             }
+        } else {
+            /* We are already corked, or can't cork so let's just call the handler */
+            handler();
         }
 
         return this;
     }
 
     /* Attach handler for writable HTTP response */
-    HttpResponse *onWritable(fu2::unique_function<bool(int)> &&handler) {
+    HttpResponse *onWritable(fu2::unique_function<bool(size_t)> &&handler) {
         HttpResponseData<SSL> *httpResponseData = getHttpResponseData();
 
         httpResponseData->onWritable = std::move(handler);
